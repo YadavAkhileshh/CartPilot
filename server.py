@@ -1,4 +1,5 @@
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import tempfile
 import uuid
 import json
@@ -10,6 +11,12 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 from shopping_agent import agent
+import setup_db
+
+if not os.path.exists("store.db") or not os.path.exists("faiss_index"):
+    print("Initializing database and FAISS index for the first time...")
+    setup_db.create_database()
+    setup_db.create_vector_db()
 
 app = FastAPI(title="CartPilot API")
 
@@ -76,4 +83,5 @@ async def upload_image(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
