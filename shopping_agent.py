@@ -21,8 +21,26 @@ vision_llm = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct", tempera
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools & Global Cache
 # ---------------------------------------------------------------------------
+
+VECTOR_STORE = None
+
+def get_vector_store():
+    global VECTOR_STORE
+    if VECTOR_STORE is None:
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings
+            from langchain_community.vectorstores import FAISS
+            index_path = os.path.join(os.path.dirname(__file__), "faiss_index")
+            if os.path.exists(index_path):
+                print("Loading FAISS Vector Store into memory...")
+                embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+                VECTOR_STORE = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+                print("FAISS Vector Store loaded successfully.")
+        except Exception as e:
+            print(f"Failed to load vector store: {e}")
+    return VECTOR_STORE
 
 @tool
 def search_products(query: str, max_price: Optional[float] = None, is_organic: Optional[bool] = None) -> str:
@@ -80,26 +98,27 @@ def search_products(query: str, max_price: Optional[float] = None, is_organic: O
     # 2. Semantic Vector Search (FAISS)
     final_products = []
     if query:
-        try:
-            from langchain_huggingface import HuggingFaceEmbeddings
-            from langchain_community.vectorstores import FAISS
-            
-            index_path = os.path.join(os.path.dirname(__file__), "faiss_index")
-            embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-            vector_store = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
-            
-            # Retrieve top 10 closest semantic matches
-            docs = vector_store.similarity_search(query, k=10)
-            
-            # Intersect: Only keep FAISS results that passed the SQL pre-filter
-            for doc in docs:
-                p_id = doc.metadata.get("id")
-                if p_id in sql_products:
-                    final_products.append(sql_products[p_id])
-                    
-        except Exception as e:
-            print(f"Vector search failed: {e}. Falling back to SQL ONLY.")
-            # Fallback to simple python filtering if FAISS isn't ready
+        vector_store = get_vector_store()
+        if vector_store:
+            try:
+                # Retrieve top 10 closest semantic matches
+                docs = vector_store.similarity_search(query, k=10)
+                
+                # Intersect: Only keep FAISS results that passed the SQL pre-filter
+                for doc in docs:
+                    p_id = doc.metadata.get("id")
+                    if p_id in sql_products:
+                        final_products.append(sql_products[p_id])
+                        
+            except Exception as e:
+                print(f"Vector search failed: {e}. Falling back to SQL ONLY.")
+                # Fallback to simple python filtering if FAISS isn't ready
+                like_query = query.lower()
+                for p_id, p in sql_products.items():
+                    if like_query in p["name"].lower() or like_query in p["description"].lower() or like_query in p["category"].lower():
+                        final_products.append(p)
+        else:
+            # Fallback if vector store is None
             like_query = query.lower()
             for p_id, p in sql_products.items():
                 if like_query in p["name"].lower() or like_query in p["description"].lower() or like_query in p["category"].lower():
