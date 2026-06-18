@@ -7,5 +7,5 @@ langchain-community==0.2.4
 python-multipart==0.0.9
 python-dotenv==1.0.1
 sentence-transformers==3.0.1
-faiss-cpu==1.8.0
+faiss-cpu
 pydantic==2.7.4
