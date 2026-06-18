@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CartPilot - AI Shopping Agent</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <header class="header">
+            <div class="logo">
+                <i class="ri-shopping-bag-3-fill"></i>
+                <h1>CartPilot</h1>
+            </div>
+            <div class="header-actions">
+                <button id="theme-toggle" class="icon-btn" title="Toggle Theme">
+                    <i class="ri-moon-line"></i>
+                </button>
+            </div>
+        </header>
+
+        <main class="chat-container">
+            <div id="chat-messages" class="chat-messages">
+                <div class="message assistant">
+                    <div class="message-avatar">
+                        <i class="ri-robot-2-line"></i>
+                    </div>
+                    <div class="message-content">
+                        <p>System initialized. Awaiting queries.</p>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <div class="input-area">
+            <form id="chat-form" class="chat-form">
+                <div class="image-upload-wrapper">
+                    <input type="file" id="image-upload" accept="image/*" hidden>
+                    <button type="button" id="upload-btn" class="icon-btn upload-btn" title="Upload Image">
+                        <i class="ri-image-add-line"></i>
+                    </button>
+                </div>
+                <div class="input-wrapper">
+                    <input type="text" id="chat-input" placeholder="e.g. I want organic honey under $15..." autocomplete="off">
+                </div>
+                <button type="submit" id="send-btn" class="send-btn">
+                    <i class="ri-send-plane-fill"></i>
+                </button>
+            </form>
+            <div id="upload-preview" class="upload-preview hidden">
+                <span id="preview-filename">image.jpg</span>
+                <button type="button" id="clear-upload" class="clear-upload-btn">
+                    <i class="ri-close-line"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="/static/script.js"></script>
+</body>
+</html>

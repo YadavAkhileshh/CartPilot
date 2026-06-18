@@ -1,0 +1,22 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database and Indexes
+# We don't push these because setup_db.py will generate them on the deployment server
+store.db
+faiss_index/
+
+# OS generated files
+.DS_Store
+Thumbs.db
