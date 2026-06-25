@@ -12,11 +12,17 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Database and Indexes
-# We don't push these because setup_db.py will generate them on the deployment server
+# Legacy local data files (replaced by cloud databases)
 store.db
 faiss_index/
+
+# Temporary uploaded images from server
+*.tmp
+tmp/
 
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Python version file
+.python-version

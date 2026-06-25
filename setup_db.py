@@ -1,16 +1,21 @@
-import sqlite3
 import os
+import psycopg2
+from dotenv import load_dotenv
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "store.db")
+load_dotenv()
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME")
 
 def create_database():
-    conn = sqlite3.connect(DB_PATH)
+    print("Connecting to Supabase PostgreSQL...")
+    conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY,
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             category TEXT,
             price REAL,
@@ -21,27 +26,35 @@ def create_database():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             product_id INTEGER,
             rating REAL,
             reviewer_name TEXT,
             review_text TEXT,
-            FOREIGN KEY (product_id) REFERENCES products(id)
+            FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             product_id INTEGER NOT NULL,
             product_name TEXT NOT NULL,
             price REAL NOT NULL,
-            ordered_at TEXT NOT NULL DEFAULT (datetime('now')),
-            FOREIGN KEY (product_id) REFERENCES products(id)
+            ordered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
     """)
 
     products = [
+        # (id, name, category, price, desc, is_organic)
         # --- Honey (8) ---
         (1,  "Organic Raw Honey",            "honey",        14.99, "Pure organic raw honey, unfiltered and cold-pressed",                1),
         (2,  "Wildflower Honey",             "honey",        12.99, "Natural wildflower honey from local beekeepers",                     0),
@@ -82,16 +95,10 @@ def create_database():
         (31, "Organic Coconut Milk",         "dairy-alt",     3.99, "Full-fat organic coconut milk, great for curries",                   1),
         (32, "Soy Milk",                     "dairy-alt",     3.49, "Unsweetened soy milk, high protein",                                 0),
     ]
-    cursor.executemany("INSERT OR REPLACE INTO products VALUES (?, ?, ?, ?, ?, ?)", products)
 
-    # Avg ratings (for reference):
-    # Honey:      1→4.625✓  2→3.833  3→4.833($$)  4→3.5  5→4.625✓  6→4.167  7→4.75✓  8→4.0
-    # Oils:       9→4.67   10→3.67  11→4.5        12→4.33
-    # Nuts/Seeds: 13→4.75  14→4.0   15→4.5        16→3.75
-    # Grains:     17→4.67  18→4.33  19→4.5        20→3.83
-    # Tea/Coffee: 21→4.67  22→4.17  23→4.75       24→4.0
-    # Snacks:     25→4.5   26→3.83  27→4.67       28→3.67
-    # Dairy-alt:  29→4.5   30→4.33  31→4.5        32→3.67
+    cursor.execute("TRUNCATE TABLE products CASCADE")
+    cursor.executemany("INSERT INTO products (id, name, category, price, description, is_organic) VALUES (%s, %s, %s, %s, %s, %s)", products)
+
     reviews = [
         # Honey
         (1, 5.0, "Alice",   "Amazing honey! Best I've ever tried."),
@@ -203,24 +210,24 @@ def create_database():
         (32, 3.5, "Yosef",  "Slightly thin but good for cereal."),
         (32, 3.5, "Zola",   "Decent soy milk, nothing special."),
     ]
-    cursor.execute("DELETE FROM reviews")
+    cursor.execute("TRUNCATE TABLE reviews CASCADE")
     cursor.executemany(
-        "INSERT INTO reviews (product_id, rating, reviewer_name, review_text) VALUES (?, ?, ?, ?)",
+        "INSERT INTO reviews (product_id, rating, reviewer_name, review_text) VALUES (%s, %s, %s, %s)",
         reviews,
     )
 
     conn.commit()
     conn.close()
-    print(f"Database created at: {DB_PATH}")
+    print("PostgreSQL Database created and seeded successfully!")
 
 
 def create_vector_db():
-    print("Initializing FAISS Vector Database for Semantic Search...")
+    print("Initializing Pinecone Vector Database...")
     from langchain_huggingface import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import FAISS
+    from langchain_pinecone import PineconeVectorStore
     from langchain_core.documents import Document
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, category, description, is_organic, price FROM products")
     products = cursor.fetchall()
@@ -229,16 +236,19 @@ def create_vector_db():
     docs = []
     for p in products:
         p_id, name, cat, desc, org, price = p
-        # Create a rich text representation for semantic search
         text_content = f"{name} - {cat}. {desc}. Organic: {'Yes' if org else 'No'}. Price: ${price}."
         doc = Document(page_content=text_content, metadata={"id": p_id})
         docs.append(doc)
 
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vector_store = FAISS.from_documents(docs, embeddings)
-    index_path = os.path.join(os.path.dirname(__file__), "faiss_index")
-    vector_store.save_local(index_path)
-    print(f"FAISS vector store saved to: {index_path}")
+    
+    # Push to Pinecone
+    PineconeVectorStore.from_documents(
+        docs, 
+        embeddings, 
+        index_name=PINECONE_INDEX_NAME
+    )
+    print(f"Vectors pushed to Pinecone index: {PINECONE_INDEX_NAME} successfully!")
 
 
 if __name__ == "__main__":

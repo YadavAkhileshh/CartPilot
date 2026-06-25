@@ -1,7 +1,7 @@
 import base64
 import json
 import os
-import sqlite3
+import asyncpg
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -14,164 +14,151 @@ from reviews_api import get_product_rating
 
 load_dotenv()
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "store.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME")
 
-llm = ChatGroq(model="qwen/qwen3-32b", temperature=0)
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 vision_llm = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0)
-
-
-# ---------------------------------------------------------------------------
-# Tools & Global Cache
-# ---------------------------------------------------------------------------
 
 VECTOR_STORE = None
 
 def get_vector_store():
     global VECTOR_STORE
-    if VECTOR_STORE is None:
+    if VECTOR_STORE is None and PINECONE_INDEX_NAME:
         try:
             from langchain_huggingface import HuggingFaceEmbeddings
-            from langchain_community.vectorstores import FAISS
-            index_path = os.path.join(os.path.dirname(__file__), "faiss_index")
-            if os.path.exists(index_path):
-                print("Loading FAISS Vector Store into memory...")
-                embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-                VECTOR_STORE = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
-                print("FAISS Vector Store loaded successfully.")
+            from langchain_pinecone import PineconeVectorStore
+            print("Connecting to Pinecone Vector Store...")
+            embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+            VECTOR_STORE = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
         except Exception as e:
             print(f"Failed to load vector store: {e}")
     return VECTOR_STORE
 
 @tool
-def search_products(query: str, max_price: Optional[float] = None, is_organic: Optional[bool] = None) -> str:
+async def search_products(query: str, max_price: Optional[float] = None, is_organic: Optional[bool] = None) -> str:
     """
     Search the product database using HYBRID SEARCH.
-    It pre-filters by maximum price and/or organic status using SQLite, 
-    and then performs Semantic Vector Search (FAISS) on the query.
+    It pre-filters by maximum price and/or organic status using PostgreSQL, 
+    and then performs Semantic Vector Search (Pinecone) on the query.
     Returns a JSON array of matching products, each with: id, name, category, price,
     description, is_organic.
     """
-    # Load user preferences and apply as defaults if not explicitly provided
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_preferences'")
-    if cursor.fetchone():
-        cursor.execute("SELECT key, value FROM user_preferences")
-        prefs = {row[0]: row[1] for row in cursor.fetchall()}
-        if is_organic is None and prefs.get("prefers_organic") == "True":
-            is_organic = True
-        if max_price is None and "max_price" in prefs:
-            try:
-                max_price = float(prefs["max_price"])
-            except ValueError:
-                pass
+    if not DATABASE_URL:
+        return "[]"
 
-    # 1. SQL Pre-filtering (Hard constraints)
+    conn = await asyncpg.connect(DATABASE_URL)
+    
+    # Load preferences
+    try:
+        prefs_rows = await conn.fetch("SELECT key, value FROM user_preferences")
+        prefs = {row["key"]: row["value"] for row in prefs_rows}
+    except Exception:
+        prefs = {}
+    
+    if is_organic is None and prefs.get("prefers_organic") == "True":
+        is_organic = True
+    if max_price is None and "max_price" in prefs:
+        try:
+            max_price = float(prefs["max_price"])
+        except ValueError:
+            pass
+
     sql = "SELECT id, name, category, price, description, is_organic FROM products WHERE 1=1"
-    params: list = []
-
+    params = []
+    
     if max_price is not None:
-        sql += " AND price <= ?"
         params.append(max_price)
-
+        sql += f" AND price <= ${len(params)}"
+        
     if is_organic is not None:
-        sql += " AND is_organic = ?"
         params.append(1 if is_organic else 0)
+        sql += f" AND is_organic = ${len(params)}"
 
-    cursor.execute(sql, params)
-    rows = cursor.fetchall()
-    conn.close()
+    rows = await conn.fetch(sql, *params)
+    await conn.close()
 
-    # Create a dictionary of SQL-allowed products for fast lookup
     sql_products = {
-        row[0]: {
-            "id":          row[0],
-            "name":        row[1],
-            "category":    row[2],
-            "price":       row[3],
-            "description": row[4],
-            "is_organic":  bool(row[5]),
+        row["id"]: {
+            "id":          row["id"],
+            "name":        row["name"],
+            "category":    row["category"],
+            "price":       row["price"],
+            "description": row["description"],
+            "is_organic":  bool(row["is_organic"]),
         }
         for row in rows
     }
 
-    # 2. Semantic Vector Search (FAISS)
     final_products = []
     if query:
         vector_store = get_vector_store()
         if vector_store:
             try:
-                # Retrieve top 10 closest semantic matches
-                docs = vector_store.similarity_search(query, k=10)
+                # Retrieve top 10 closest semantic matches asynchronously
+                docs = await vector_store.asimilarity_search(query, k=10)
                 
-                # Intersect: Only keep FAISS results that passed the SQL pre-filter
                 for doc in docs:
-                    p_id = doc.metadata.get("id")
+                    p_id = int(doc.metadata.get("id", -1))
                     if p_id in sql_products:
                         final_products.append(sql_products[p_id])
                         
             except Exception as e:
                 print(f"Vector search failed: {e}. Falling back to SQL ONLY.")
-                # Fallback to simple python filtering if FAISS isn't ready
                 like_query = query.lower()
                 for p_id, p in sql_products.items():
                     if like_query in p["name"].lower() or like_query in p["description"].lower() or like_query in p["category"].lower():
                         final_products.append(p)
         else:
-            # Fallback if vector store is None
             like_query = query.lower()
             for p_id, p in sql_products.items():
                 if like_query in p["name"].lower() or like_query in p["description"].lower() or like_query in p["category"].lower():
                     final_products.append(p)
     else:
-        # If no semantic query, just return the SQL filtered list
         final_products = list(sql_products.values())
 
     return json.dumps(final_products)
 
-
 @tool
-def get_rating(product_id: int) -> str:
+async def get_rating(product_id: int) -> str:
     """
     Get the average customer rating and total review count for a product by its ID.
     Returns a JSON object with: product_id, average_rating, review_count.
     """
-    result = get_product_rating(product_id)
+    result = await get_product_rating(product_id)
     return json.dumps(result)
 
-
 @tool
-def checkout(product_id: int) -> str:
+async def checkout(product_id: int) -> str:
     """
     Place an order for the given product ID. Saves the order to the database and returns
     a confirmation message with the order ID, product name, and price.
     """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, price FROM products WHERE id = ?", (product_id,))
-    row = cursor.fetchone()
+    if not DATABASE_URL:
+        return "Error: Database not connected."
+        
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT name, price FROM products WHERE id = $1", product_id)
 
     if not row:
-        conn.close()
+        await conn.close()
         return f"Error: product with ID {product_id} not found."
 
-    name, price = row
-    cursor.execute(
-        "INSERT INTO orders (product_id, product_name, price) VALUES (?, ?, ?)",
-        (product_id, name, price),
+    name, price = row["name"], row["price"]
+    
+    order_id = await conn.fetchval(
+        "INSERT INTO orders (product_id, product_name, price) VALUES ($1, $2, $3) RETURNING id",
+        product_id, name, price
     )
-    order_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    await conn.close()
 
     return (
         f"Order #{order_id} confirmed! '{name}' has been successfully ordered for ${price:.2f}. "
         f"Your order will arrive in 3-5 business days. Thank you for shopping with us!"
     )
 
-
 @tool
-def describe_product_image(image_path: str) -> str:
+async def describe_product_image(image_path: str) -> str:
     """
     Analyze a product image and return its key attributes as a JSON object.
     Use this when the user uploads a photo of a product they are interested in.
@@ -201,82 +188,70 @@ def describe_product_image(image_path: str) -> str:
         },
     ])
 
-    response = vision_llm.invoke([message])
+    response = await vision_llm.ainvoke([message])
     return response.content
 
-
-# ---------------------------------------------------------------------------
-# Order History & Preferences Tools & Helpers
-# ---------------------------------------------------------------------------
-
 @tool
-def get_order_history() -> str:
+async def get_order_history() -> str:
     """
     Retrieve the history of all orders placed by the user.
     Returns a JSON array of orders, each with: id, product_id, product_name, price, ordered_at.
-    Use this when the user asks "what have I ordered before?" or about their previous orders.
     """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, product_id, product_name, price, ordered_at FROM orders")
-    rows = cursor.fetchall()
-    conn.close()
+    if not DATABASE_URL:
+        return "[]"
+        
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch("SELECT id, product_id, product_name, price, ordered_at FROM orders")
+    await conn.close()
 
     orders = [
         {
-            "id":           row[0],
-            "product_id":   row[1],
-            "product_name": row[2],
-            "price":        row[3],
-            "ordered_at":   row[4],
+            "id":           row["id"],
+            "product_id":   row["product_id"],
+            "product_name": row["product_name"],
+            "price":        row["price"],
+            "ordered_at":   str(row["ordered_at"]),
         }
         for row in rows
     ]
     return json.dumps(orders)
 
-
 @tool
-def save_user_preference(key: str, value: str) -> str:
+async def save_user_preference(key: str, value: str) -> str:
     """
     Save or update a user preference to remember it across sessions.
     Supported keys:
     - 'prefers_organic': set to 'True' if the user always prefers organic products, or 'False' otherwise.
     - 'max_price': set to a numeric value (e.g., '20') if the user never wants items over that price limit.
-    Use this when the user explicitly expresses a long-term preference (e.g. 'I only buy organic', 
-    'never show me items over $20', 'remember that I prefer organic').
-    Returns a confirmation message.
     """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    # Ensure table exists
-    cursor.execute("CREATE TABLE IF NOT EXISTS user_preferences (key TEXT PRIMARY KEY, value TEXT)")
-    cursor.execute(
-        "INSERT OR REPLACE INTO user_preferences (key, value) VALUES (?, ?)",
-        (key.strip(), value.strip()),
+    if not DATABASE_URL:
+        return "Error: Database not connected."
+        
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        """
+        INSERT INTO user_preferences (key, value) VALUES ($1, $2)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        key.strip(), value.strip()
     )
-    conn.commit()
-    conn.close()
+    await conn.close()
     return f"Preference '{key}' has been saved as '{value}'."
 
+async def get_user_preferences() -> dict:
+    if not DATABASE_URL:
+        return {}
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        rows = await conn.fetch("SELECT key, value FROM user_preferences")
+        await conn.close()
+        return {row["key"]: row["value"] for row in rows}
+    except Exception:
+        return {}
 
-def get_user_preferences() -> dict:
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_preferences'")
-    if not cursor.fetchone():
-        cursor.execute("CREATE TABLE user_preferences (key TEXT PRIMARY KEY, value TEXT)")
-        conn.commit()
-    cursor.execute("SELECT key, value FROM user_preferences")
-    rows = cursor.fetchall()
-    conn.close()
-    return {row[0]: row[1] for row in rows}
-
-
-def get_system_prompt() -> str:
-    # 1. Load preferences
-    prefs = get_user_preferences()
+async def get_system_prompt() -> str:
+    prefs = await get_user_preferences()
     
-    # 2. Build preferences text block
     prefs_lines = []
     if prefs:
         for k, v in prefs.items():
@@ -291,7 +266,6 @@ def get_system_prompt() -> str:
     if prefs_lines:
         prefs_text = "\nACTIVE USER PREFERENCES (apply these unless the user explicitly overrides them in their query):\n" + "\n".join(prefs_lines) + "\n"
     
-    # 3. Base system prompt
     base_prompt = (
         "You are a helpful shopping assistant. Follow these rules strictly.\n\n"
         "IMAGE SEARCH — when the user provides an image path:\n"
@@ -299,41 +273,25 @@ def get_system_prompt() -> str:
         "2. Use the returned search_query and is_organic to call search_products.\n"
         "3. Continue with the BROWSING flow from step 2 onwards.\n\n"
         "BROWSING — when the user describes what they want to buy:\n"
-        "1. Call search_products to find matching items. You MUST respect the active user preferences listed below. "
-        "   Apply any price/organic preferences as default arguments to search_products (e.g. if user prefers organic, set is_organic=True; "
-        "   if they have a max price constraint, set max_price to that limit), unless the user explicitly overrides them in their current message.\n"
-        "   Note that search_products uses keyword matching on descriptions, so it may return some irrelevant items (e.g., searching 'honey' might return granola containing honey). "
-        "   You MUST filter out any products that do not match the user's intended category or product type (e.g., if they want honey, do not list granola) before presenting them.\n"
+        "1. Call search_products to find matching items. You MUST respect the active user preferences listed below.\n"
         "2. For each candidate, call get_rating to retrieve its average rating.\n"
         "3. Filter by the user's minimum rating if specified.\n"
-        "4. Present qualifying products as a numbered list. For each item use this exact format "
-        "   (plain text, no backticks, no code blocks, no bold, no italic):\n\n"
+        "4. Present qualifying products as a numbered list. For each item use this exact format:\n\n"
         "   #<number>. <name> (ID:<product_id>) — $<price> ★<rating> — <organic or non-organic>\n\n"
-        "   Add a blank line between each product entry for readability. "
-        "   Always include (ID:X) so you can reference it later.\n"
-        "5. If only one product qualifies, still show it in the list and ask: "
-        "   'Would you like to order it? Just say yes or give me the number.'\n"
+        "   Add a blank line between each product entry for readability.\n"
+        "5. If only one product qualifies, ask: 'Would you like to order it? Just say yes or give me the number.'\n"
         "6. Do NOT call checkout at this stage.\n\n"
-        "ORDERING — when the user confirms they want to buy (e.g. 'yes', 'sure', 'go ahead', "
-        "'order number 2', 'the first one', 'get me #3'):\n"
-        "1. Look at your previous message to find the (ID:X) for the chosen product "
-        "   (if only one was listed and the user says 'yes', use that product's ID).\n"
+        "ORDERING — when the user confirms they want to buy:\n"
+        "1. Look at your previous message to find the (ID:X) for the chosen product.\n"
         "2. Call checkout with that product_id (the number from (ID:X)).\n"
         "3. Confirm the order to the user in plain text.\n\n"
-        "USER PREFERENCES — when the user expresses a long-term preference (e.g., 'I only buy organic', "
-        "'never show me items over $20', 'always prefer organic'):\n"
-        "1. Call save_user_preference to save it.\n"
-        "2. Confirm to the user that you've saved their preference and will remember it for future sessions.\n\n"
-        "Never place an order unless the user explicitly confirms. "
-        "Never guess a product_id — always take it from the (ID:X) in your own previous message.\n"
+        "USER PREFERENCES:\n"
+        "1. Call save_user_preference to save long-term rules.\n"
+        "2. Confirm to the user that you've saved their preference.\n\n"
+        "Never place an order unless explicitly confirmed. Never guess a product_id.\n"
     )
     
     return base_prompt + prefs_text
-
-
-# ---------------------------------------------------------------------------
-# Guardrails & Agent Wrapper
-# ---------------------------------------------------------------------------
 
 def get_latest_user_message(messages) -> Optional[str]:
     for msg in reversed(messages):
@@ -348,11 +306,7 @@ def get_latest_user_message(messages) -> Optional[str]:
             return msg.content
     return None
 
-
-def check_guardrail(message: str) -> bool:
-    """
-    Returns True if the message is shopping-related, False otherwise.
-    """
+async def check_guardrail(message: str) -> bool:
     if not message:
         return True
     
@@ -361,38 +315,13 @@ def check_guardrail(message: str) -> bool:
         return True
         
     prompt = f"""You are a guardrail classifier for a shopping assistant.
-Determine if the user's message is related to shopping, products, orders, preferences, or interacting with the shopping assistant (including greetings like 'hi' or 'hello' and asking what the assistant can do).
-
-Classify as SHOPPING_RELATED if the message is:
-- Searching for products (e.g. "I want organic honey")
-- Inquiring about previous orders (e.g. "what did I buy before?")
-- Stating preferences (e.g. "I only buy organic", "max price is $20")
-- Placing an order or checking out (e.g. "yes", "please order it", "order number 2")
-- Requesting ratings or product info (e.g. "tell me about product 5")
-- Greeting or polite conversation (e.g. "hi", "hello", "thanks")
-- Asking what the assistant does
-
-Classify as OFF_TOPIC if the message is:
-- Asking for general knowledge/facts (e.g. "what is the capital of France?", "who is Einstein?")
-- Asking for weather (e.g. "what's the weather?")
-- Asking to write poems, stories, essays, code, etc.
-- Solving math/logic puzzles unrelated to the shopping products
-- Asking general programming questions
-
-Respond with ONLY the classification: either SHOPPING_RELATED or OFF_TOPIC. Do not write any other words.
-
+Classify as SHOPPING_RELATED or OFF_TOPIC. Respond ONLY with the classification.
 User message: "{cleaned}"
 Classification:"""
     
     try:
-        response = llm.invoke(prompt)
-        res_text = response.content.strip()
-        # Remove think block if present
-        if "<think>" in res_text.lower():
-            parts = res_text.lower().split("</think>")
-            if len(parts) > 1:
-                res_text = parts[-1].strip()
-        res_text = res_text.upper()
+        response = await llm.ainvoke(prompt)
+        res_text = response.content.strip().upper()
         if "OFF_TOPIC" in res_text and "SHOPPING_RELATED" not in res_text:
             return False
         if "OFF_TOPIC" in res_text and "SHOPPING_RELATED" in res_text:
@@ -400,62 +329,49 @@ Classification:"""
             idx_shop = res_text.rfind("SHOPPING_RELATED")
             if idx_off > idx_shop:
                 return False
-    except Exception as e:
-        print(f"Guardrail error: {e}")
-        # Default to True on failure
+    except Exception:
         return True
     return True
 
-
 class PersonalShopperAgent:
-    def invoke(self, input_data: dict, config=None):
-        # 1. Input Guardrail check
+    async def ainvoke(self, input_data: dict, config=None):
         messages = input_data.get("messages", [])
         latest_user_msg = get_latest_user_message(messages)
         
         if latest_user_msg is not None:
-            if not check_guardrail(latest_user_msg):
+            if not await check_guardrail(latest_user_msg):
                 out_messages = list(messages)
-                redirect_content = (
-                    "I'm sorry, but I can only help you with shopping-related requests, "
-                    "such as searching for products, viewing ratings, managing your order history, "
-                    "or placing orders. How can I help you with your shopping today?"
-                )
-                out_messages.append(AIMessage(content=redirect_content))
+                out_messages.append(AIMessage(content="I'm sorry, but I can only help you with shopping-related requests. How can I help you with your shopping today?"))
                 return {"messages": out_messages}
         
-        # 2. Get preferences & build dynamic system prompt
-        system_prompt = get_system_prompt()
+        system_prompt = await get_system_prompt()
         
-        # 3. Create the LangGraph agent
         compiled_agent = create_agent(
             tools=[search_products, get_rating, checkout, describe_product_image, get_order_history, save_user_preference],
             model=llm,
             system_prompt=system_prompt
         )
         
-        # 4. Invoke the agent
-        return compiled_agent.invoke(input_data, config)
-
+        return await compiled_agent.ainvoke(input_data, config)
+    
+    async def astream_events(self, input_data: dict, config=None, **kwargs):
+        messages = input_data.get("messages", [])
+        latest_user_msg = get_latest_user_message(messages)
+        
+        if latest_user_msg is not None:
+            if not await check_guardrail(latest_user_msg):
+                # Fake a stream event for guardrail block
+                yield {"event": "on_chat_model_stream", "data": {"chunk": AIMessage(content="I'm sorry, but I can only help you with shopping-related requests.")}}
+                return
+                
+        system_prompt = await get_system_prompt()
+        compiled_agent = create_agent(
+            tools=[search_products, get_rating, checkout, describe_product_image, get_order_history, save_user_preference],
+            model=llm,
+            system_prompt=system_prompt
+        )
+        
+        async for event in compiled_agent.astream_events(input_data, config, version="v1"):
+            yield event
 
 agent = PersonalShopperAgent()
-
-if __name__ == "__main__":
-
-    # image_path = os.path.join("resources","oats.png")
-    # response = describe_product_image(image_path)
-    # print(response)
-
-    result = agent.invoke(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        "I want to buy organic honey with 4.5+ rating and less than $20 price."
-                    ),
-                }
-            ]
-        }
-    )
-    print(result["messages"][-1].content)

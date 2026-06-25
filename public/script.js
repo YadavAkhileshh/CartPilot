@@ -8,14 +8,14 @@ const uploadPreview = document.getElementById('upload-preview');
 const previewFilename = document.getElementById('preview-filename');
 const clearUploadBtn = document.getElementById('clear-upload');
 
-let sessionId = crypto.randomUUID();
-
-// Theme setup
-const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-if (prefersDark) {
-    document.documentElement.setAttribute('data-theme', 'dark');
-    themeToggle.innerHTML = '<i class="ri-sun-line"></i>';
+let sessionId = localStorage.getItem('cartpilot_session_id');
+if (!sessionId) {
+    sessionId = crypto.randomUUID();
+    localStorage.setItem('cartpilot_session_id', sessionId);
 }
+
+// Theme setup defaults to light mode
+themeToggle.innerHTML = '<i class="ri-moon-line"></i>';
 
 themeToggle.addEventListener('click', () => {
     const currentTheme = document.documentElement.getAttribute('data-theme');
@@ -50,22 +50,8 @@ function scrollToBottom() {
     chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
-// Parses <think> blocks into an accordion
 function formatContent(content) {
-    let formatted = content;
-    
-    // Replace <think>...</think> with an accordion
-    const thinkRegex = /<think>([\s\S]*?)<\/think>/gi;
-    formatted = formatted.replace(thinkRegex, (match, p1) => {
-        return `
-            <details class="think-block">
-                <summary>Thinking Process...</summary>
-                <div class="think-content">${p1.trim()}</div>
-            </details>
-        `;
-    });
-    
-    return marked.parse(formatted);
+    return marked.parse(content);
 }
 
 function addMessage(role, content, imageUrl = null) {
@@ -178,9 +164,64 @@ chatForm.addEventListener('submit', async (e) => {
                 })
             });
             
-            const data = await response.json();
             removeSkeleton(skeleton);
-            addMessage('assistant', data.response);
+            
+            // Create a new message bubble for streaming
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message assistant`;
+            messageDiv.innerHTML = `
+                <div class="message-avatar">
+                    <i class="ri-robot-2-line"></i>
+                </div>
+                <div class="message-content"></div>
+            `;
+            chatMessages.appendChild(messageDiv);
+            const contentDiv = messageDiv.querySelector('.message-content');
+            
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let fullContent = "";
+            let buffer = "";
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                
+                // Keep the last incomplete line in the buffer
+                buffer = lines.pop() || "";
+                
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const dataStr = line.substring(6).trim();
+                        if (dataStr === '[DONE]') continue;
+                        try {
+                            const data = JSON.parse(dataStr);
+                            fullContent += data.chunk;
+                            contentDiv.innerHTML = formatContent(fullContent);
+                            scrollToBottom();
+                        } catch (e) {
+                            // Ignore incomplete JSON chunks from SSE chunking
+                        }
+                    }
+                }
+            }
+            
+            // Process any remaining buffer
+            if (buffer.startsWith('data: ')) {
+                const dataStr = buffer.substring(6).trim();
+                if (dataStr !== '[DONE]') {
+                    try {
+                        const data = JSON.parse(dataStr);
+                        fullContent += data.chunk;
+                        contentDiv.innerHTML = formatContent(fullContent);
+                        scrollToBottom();
+                    } catch (e) {}
+                }
+            }
+            
         } catch (error) {
             console.error('Error:', error);
             removeSkeleton(skeleton);
