@@ -312,7 +312,7 @@ The application is stateless by design. There are no local files that need to pe
 
 ---
 
-## Interview Questions This Project Covers
+## Design Decisions & Technical FAQ
 
 **What is the ReAct pattern?** - ReAct stands for Reasoning and Acting. The model alternates between reasoning about what to do and calling a tool to do it. After each tool call it observes the result and reasons again. This repeats until the model can give a final answer. I use LangChain's create_agent which implements this loop.
 
