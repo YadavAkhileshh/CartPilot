@@ -3,7 +3,7 @@ services:
     name: cartpilot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python setup_db.py && python server.py
+    startCommand: python server.py
     envVars:
       - key: DATABASE_URL
         sync: false
